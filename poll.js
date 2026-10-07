@@ -1,11 +1,13 @@
 // poll.js - 24/7 PR + PR-comment + link watcher for GitHub Actions.
 //
 // Runs on GitHub's own runners (public repo = free, unlimited minutes).
-// Polls a GitHub repo's PRs and PR comments every POLL_SECONDS - the target
-// repo lives in the WATCH_REPO secret and is never named in code, logs, or
-// state. Pushes to ntfy the moment anything lands. A fresh (<55 min)
-// single-use pairing link triggers an URGENT push carrying the full link;
-// tapping the notification opens it directly (ntfy "Click" header).
+// Polls a GitHub repo's PRs, PR comments (issue-style AND review/inline
+// comments), PR bodies, and issues every POLL_SECONDS - the target repo
+// lives in the WATCH_REPO secret and is never named in code, logs, or
+// state. Pushes to ntfy the moment anything lands, regardless of whether
+// the PR is open or closed. A fresh (<55 min) single-use pairing link
+// triggers an URGENT push carrying the full link; tapping the notification
+// opens it directly (ntfy "Click" header).
 //
 // Chain mode (CHAIN=true): watch for RUN_MINUTES (~5.5h), then exit - the
 // workflow dispatches the next run, giving seamless 24/7 coverage. The
@@ -31,8 +33,12 @@ if (!REPO) {
   process.exit(1);
 }
 
+// issue-style comments: covers ALL PRs and issues, open or closed
 const API = `https://api.github.com/repos/${REPO}/issues/comments?sort=created&direction=desc&per_page=20`;
-const PRS_API = `https://api.github.com/repos/${REPO}/pulls?sort=created&direction=desc&per_page=10`;
+// review/inline comments on PR diffs: covers ALL PRs, open or closed
+const REVIEWS_API = `https://api.github.com/repos/${REPO}/pulls/comments?sort=created&direction=desc&per_page=15`;
+// PRs themselves (bodies scanned for links too): ALL states incl. closed/merged
+const PRS_API = `https://api.github.com/repos/${REPO}/pulls?state=all&sort=created&direction=desc&per_page=10`;
 const FRESH_MS = 55 * 60 * 1000;      // pairing links are short-TTL - only scream on fresh ones
 const RECENT_MS = 6 * 60 * 60 * 1000; // pushes only for recent items
 const HEARTBEAT_MS = 12 * 60 * 60 * 1000;
@@ -43,7 +49,7 @@ function log(m) { console.log(new Date().toISOString().slice(0, 19).replace('T',
 const tokHash = (t) => crypto.createHash('sha256').update(String(t)).digest('hex').slice(0, 32);
 
 // ---------- state ----------
-let state = { seen: [], alerted: [], prs: [], lastHeartbeat: 0 };
+let state = { seen: [], rseen: [], alerted: [], prs: [], lastHeartbeat: 0 };
 let baseline = false;
 try {
   state = { ...state, ...JSON.parse(fs.readFileSync('state.json', 'utf8')) };
@@ -51,6 +57,7 @@ try {
   baseline = true; // no state file yet: mark everything known, alert only fresh items
 }
 const seen = new Set(state.seen);
+const rSeen = new Set(state.rseen);
 const alerted = new Set(state.alerted);
 const prsSeen = new Set(state.prs);
 let dirty = false;
@@ -58,6 +65,7 @@ let dirty = false;
 function saveState() {
   if (!dirty) return;
   state.seen = [...seen].slice(-200);
+  state.rseen = [...rSeen].slice(-200);
   state.alerted = [...alerted].slice(-50);
   state.prs = [...prsSeen].slice(-100);
   fs.writeFileSync('state.json', JSON.stringify(state));
@@ -103,11 +111,68 @@ async function ntfy({ title, body, priority, tags, click }) {
   return false;
 }
 
+// ---------- link handling ----------
+// Shared: detect + alert pairing links in any text. Returns true if a fresh
+// (urgent) link fired, so callers can suppress a duplicate comment push.
+async function scanLinks(text, age) {
+  const links = text.match(LINK_RE) || [];
+  let fired = false;
+  for (const link of links) {
+    const h = tokHash(link.split('token=')[1]);
+    if (alerted.has(h)) continue;
+    alerted.add(h);
+    dirty = true;
+    if (age < FRESH_MS) {
+      const minsLeft = Math.max(1, Math.round((FRESH_MS - age) / 60000));
+      log('*** fresh pairing link detected - urgent push sent');
+      await ntfy({
+        title: `FRESH PAIR LINK - GO NOW (~${minsLeft} min left)`,
+        body: link,
+        priority: 'urgent',
+        tags: 'rotating_light',
+        click: link,
+      });
+      fired = true;
+    } else {
+      log(`pair link seen, already expired (${Math.round(age / 60000)} min old)`);
+    }
+  }
+  return fired;
+}
+
+// ---------- comment scanning ----------
+// Shared: one comment item (issue-style or review/inline). keyOf distinguishes
+// the two ID spaces. Pushes a snippet notification for new recent comments.
+async function scanComment(c, seenSet, keyOf) {
+  const age = Date.now() - Date.parse(c.created_at);
+  const body = c.body || '';
+  const key = keyOf(c);
+  const fired = await scanLinks(body, age);
+  if (!seenSet.has(key)) {
+    seenSet.add(key);
+    dirty = true;
+    if (!baseline && !fired && age < RECENT_MS) {
+      const snippet = body.replace(/\s+/g, ' ').slice(0, 200);
+      const deploy = /test (deployment|instance)/i.test(body);
+      log('comment push sent');
+      await ntfy({
+        title: deploy ? 'test-deploy comment (link often follows)'
+                      : `new comment by ${c.user ? c.user.login : '?'}`,
+        body: snippet + '\n\n' + (c.html_url || ''),
+        priority: deploy ? 'high' : 'default',
+        tags: deploy ? 'rocket' : 'speech_balloon',
+        click: c.html_url,
+      });
+    }
+  }
+}
+
 // ---------- poll ----------
 async function poll() {
   const headers = { 'User-Agent': 'status-checks', Accept: 'application/vnd.github+json' };
   if (process.env.GH_TOKEN) headers.Authorization = 'Bearer ' + process.env.GH_TOKEN;
 
+  // 1. issue-style comments on all PRs + issues (any state)
   const res = await fetch(API, { headers });
   if (res.status === 403 || res.status === 429) {
     log('rate limited - waiting 60s');
@@ -117,55 +182,25 @@ async function poll() {
   if (!res.ok) throw new Error('HTTP ' + res.status);
   const comments = await res.json();
   if (Array.isArray(comments) && comments.length) {
-
     for (const c of comments.slice().sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at))) {
-      const age = Date.now() - Date.parse(c.created_at);
-      const body = c.body || '';
-      const links = body.match(LINK_RE) || [];
-      let fired = false;
-
-      for (const link of links) {
-        const h = tokHash(link.split('token=')[1]);
-        if (alerted.has(h)) continue;
-        alerted.add(h);
-        dirty = true;
-        if (age < FRESH_MS) {
-          const minsLeft = Math.max(1, Math.round((FRESH_MS - age) / 60000));
-          log('*** fresh pairing link detected - urgent push sent');
-          await ntfy({
-            title: `FRESH PAIR LINK - GO NOW (~${minsLeft} min left)`,
-            body: link,
-            priority: 'urgent',
-            tags: 'rotating_light',
-            click: link,
-          });
-          fired = true;
-        } else {
-          log(`pair link seen, already expired (${Math.round(age / 60000)} min old)`);
-        }
-      }
-
-      if (!seen.has(c.id)) {
-        seen.add(c.id);
-        dirty = true;
-        if (!baseline && !fired && age < RECENT_MS) {
-          const snippet = body.replace(/\s+/g, ' ').slice(0, 200);
-          const deploy = /test (deployment|instance)/i.test(body);
-          log('comment push sent');
-          await ntfy({
-            title: deploy ? 'test-deploy comment (link often follows)'
-                          : `new comment by ${c.user ? c.user.login : '?'}`,
-            body: snippet + '\n\n' + (c.html_url || ''),
-            priority: deploy ? 'high' : 'default',
-            tags: deploy ? 'rocket' : 'speech_balloon',
-            click: c.html_url,
-          });
-        }
-      }
+      await scanComment(c, seen, (x) => x.id);
     }
   }
 
-  // new PRs opened (early warning - a pairing link usually follows)
+  // 2. review/inline comments on all PRs (any state)
+  try {
+    const rvRes = await fetch(REVIEWS_API, { headers });
+    if (rvRes.ok) {
+      const reviews = await rvRes.json();
+      if (Array.isArray(reviews) && reviews.length) {
+        for (const c of reviews.slice().sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at))) {
+          await scanComment(c, rSeen, (x) => 'r' + x.id);
+        }
+      }
+    }
+  } catch (e) { log('review poll failed: ' + e.message); }
+
+  // 3. PRs themselves: new-PR ping + body scanned for links (any state)
   try {
     const prRes = await fetch(PRS_API, { headers });
     if (prRes.ok) {
@@ -186,6 +221,8 @@ async function poll() {
               click: p.html_url,
             });
           }
+          // a pairing link can also live in the PR body
+          await scanLinks(p.body || '', age);
         }
       }
     }
