@@ -58,4 +58,192 @@ let dirty = false;
 function saveState() {
   if (!dirty) return;
   state.seen = [...seen].slice(-200);
-  state.alerted =
+  state.alerted = [...alerted].slice(-50);
+  state.prs = [...prsSeen].slice(-100);
+  fs.writeFileSync('state.json', JSON.stringify(state));
+}
+
+// Commit state back to the repo (idempotent add/commit/push). Runs every
+// ~10 min in chain mode so a cancelled run loses at most 10 min of state.
+function gitPersist() {
+  try {
+    if (!fs.existsSync('state.json')) return;
+    execSync('git add state.json', { stdio: 'ignore' });
+    try { execSync('git commit -q -m "state update"', { stdio: 'ignore' }); } catch (e) {} // no-op if unchanged
+    try {
+      execSync('git push -q', { stdio: 'ignore' });
+      dirty = false;
+      log('state committed');
+    } catch (e) {
+      try {
+        execSync('git pull -q --rebase', { stdio: 'ignore' });
+        execSync('git push -q', { stdio: 'ignore' });
+        dirty = false;
+        log('state committed');
+      } catch (e2) { log('state push deferred: ' + String(e2.message).split('\n')[0]); }
+    }
+  } catch (e) {
+    log('state commit deferred: ' + String(e.message).split('\n')[0]);
+  }
+}
+
+// ---------- ntfy ----------
+async function ntfy({ title, body, priority, tags, click }) {
+  if (!TOPIC) { log('NTFY_TOPIC not set - push skipped: ' + title); return false; }
+  const headers = { Title: title, Priority: priority, Tags: tags };
+  if (click) headers.Click = click;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(`https://ntfy.sh/${TOPIC}`, { method: 'POST', headers, body });
+      if (res.ok) return true;
+      log(`ntfy HTTP ${res.status}`);
+    } catch (e) { log('ntfy failed: ' + e.message); }
+    await new Promise(r => setTimeout(r, 10_000));
+  }
+  return false;
+}
+
+// ---------- poll ----------
+async function poll() {
+  const headers = { 'User-Agent': 'status-checks', Accept: 'application/vnd.github+json' };
+  if (process.env.GH_TOKEN) headers.Authorization = 'Bearer ' + process.env.GH_TOKEN;
+
+  const res = await fetch(API, { headers });
+  if (res.status === 403 || res.status === 429) {
+    log('rate limited - waiting 60s');
+    await new Promise(r => setTimeout(r, 60_000));
+    return;
+  }
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const comments = await res.json();
+  if (Array.isArray(comments) && comments.length) {
+
+    for (const c of comments.slice().sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at))) {
+      const age = Date.now() - Date.parse(c.created_at);
+      const body = c.body || '';
+      const links = body.match(LINK_RE) || [];
+      let fired = false;
+
+      for (const link of links) {
+        const h = tokHash(link.split('token=')[1]);
+        if (alerted.has(h)) continue;
+        alerted.add(h);
+        dirty = true;
+        if (age < FRESH_MS) {
+          const minsLeft = Math.max(1, Math.round((FRESH_MS - age) / 60000));
+          log('*** fresh pairing link detected - urgent push sent');
+          await ntfy({
+            title: `FRESH PAIR LINK - GO NOW (~${minsLeft} min left)`,
+            body: link,
+            priority: 'urgent',
+            tags: 'rotating_light',
+            click: link,
+          });
+          fired = true;
+        } else {
+          log(`pair link seen, already expired (${Math.round(age / 60000)} min old)`);
+        }
+      }
+
+      if (!seen.has(c.id)) {
+        seen.add(c.id);
+        dirty = true;
+        if (!baseline && !fired && age < RECENT_MS) {
+          const snippet = body.replace(/\s+/g, ' ').slice(0, 200);
+          const deploy = /test (deployment|instance)/i.test(body);
+          log('comment push sent');
+          await ntfy({
+            title: deploy ? 'test-deploy comment (link often follows)'
+                          : `new comment by ${c.user ? c.user.login : '?'}`,
+            body: snippet + '\n\n' + (c.html_url || ''),
+            priority: deploy ? 'high' : 'default',
+            tags: deploy ? 'rocket' : 'speech_balloon',
+            click: c.html_url,
+          });
+        }
+      }
+    }
+  }
+
+  // new PRs opened (early warning - a pairing link usually follows)
+  try {
+    const prRes = await fetch(PRS_API, { headers });
+    if (prRes.ok) {
+      const prs = await prRes.json();
+      if (Array.isArray(prs)) {
+        for (const p of prs.slice().sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at))) {
+          if (prsSeen.has(p.number)) continue;
+          prsSeen.add(p.number);
+          dirty = true;
+          const age = Date.now() - Date.parse(p.created_at);
+          if (!baseline && age < RECENT_MS) {
+            log('new PR push sent');
+            await ntfy({
+              title: `new PR #${p.number} opened`,
+              body: (p.title || '') + '\n\n' + (p.html_url || ''),
+              priority: 'high',
+              tags: 'pull_request',
+              click: p.html_url,
+            });
+          }
+        }
+      }
+    }
+  } catch (e) { log('PR poll failed: ' + e.message); }
+
+  if (!baseline && Date.now() - (state.lastHeartbeat || 0) > HEARTBEAT_MS) {
+    state.lastHeartbeat = Date.now();
+    dirty = true;
+    log('heartbeat push');
+    await ntfy({
+      title: 'watcher alive',
+      body: 'still watching - ' + new Date().toISOString(),
+      priority: 'min',
+      tags: 'white_check_mark',
+    });
+  }
+  saveState();
+}
+
+// ---------- main ----------
+async function main() {
+  log(`watch started - chain=${CHAIN} run=${RUN_MINUTES}min poll=${POLL_SECONDS}s (target kept secret)`);
+  if (!TOPIC) log('WARNING: NTFY_TOPIC secret missing - all pushes will be skipped!');
+
+  if (TEST_PUSH) {
+    await ntfy({
+      title: 'TEST - watcher is live',
+      body: 'Pushes work. Fresh items will arrive here - a pairing link arrives with the full link, tap it immediately.',
+      priority: 'high',
+      tags: 'tada',
+    });
+    return;
+  }
+
+  if (RUN_MINUTES === 0) { // single-poll mode (cron-driven)
+    for (let i = 1; i <= 3; i++) {
+      try { await poll(); break; }
+      catch (e) { log(`poll attempt ${i} failed: ` + e.message); await new Promise(r => setTimeout(r, 30_000)); }
+    }
+    saveState();
+    gitPersist();
+    log('run complete');
+    return;
+  }
+
+  const deadline = Date.now() + RUN_MINUTES * 60_000;
+  let lastPersist = Date.now();
+  for (;;) {
+    try { await poll(); }
+    catch (e) { log('poll failed: ' + e.message + ' - will retry'); }
+    const remaining = deadline - Date.now();
+    if (remaining <= 5_000) break;
+    if (dirty && Date.now() - lastPersist > 10 * 60_000) { gitPersist(); lastPersist = Date.now(); }
+    await new Promise(r => setTimeout(r, Math.min(POLL_SECONDS * 1000, remaining)));
+  }
+  saveState();
+  gitPersist();
+  log('run complete - workflow will chain the next run');
+}
+
+main().catch(e => { log('fatal: ' + e.message); process.exit(1); });
