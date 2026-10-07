@@ -1,0 +1,73 @@
+# 24/7 link watcher. Public repo = unlimited free Actions minutes.
+# Each run polls every 60s for ~5.5h, then dispatches the next run (chain),
+# giving continuous coverage with no cron jitter. The daily cron is a safety
+# net that restarts the chain if it ever breaks.
+name: status-checks
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-push:
+        description: "Send a test push to your phone first (the watcher chain starts right after)"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 9 * * *" # 09:00 UTC daily - safety net
+
+permissions:
+  actions: write   # dispatch the next chained run
+  contents: write  # commit state.json
+
+concurrency:
+  group: watch
+  cancel-in-progress: true # a new run seamlessly takes over
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      WATCH_REPO: ${{ secrets.WATCH_REPO }}
+      GH_TOKEN: ${{ github.token }}
+      CHAIN: "true"
+      RUN_MINUTES: "330"
+      POLL_SECONDS: "60"
+      TEST_PUSH: ${{ inputs.test-push }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git
+        run: |
+          git config user.name "watcher"
+          git config user.email "watcher@users.noreply.github.com"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Watch
+        run: node poll.js
+
+      - name: Persist state
+        run: |
+          if [ -n "$(git status --porcelain -- state.json)" ]; then
+            git add state.json
+            git commit -m "state update"
+            git push
+          fi
+
+      - name: Chain next run
+        if: env.CHAIN == 'true'
+        run: |
+          for i in 1 2 3 4 5; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/watch.yml/dispatches" \
+              -d "{\"ref\":\"$GITHUB_REF_NAME\"}")
+            if [ "$code" = "204" ]; then echo "chained next run"; exit 0; fi
+            echo "dispatch attempt $i -> HTTP $code; retrying in 20s"
+            sleep 20
+          done
+          echo "::warning::could not chain - the daily safety-net cron will restart it"
