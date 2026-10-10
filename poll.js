@@ -43,7 +43,8 @@ const FRESH_MS = 55 * 60 * 1000;      // pairing links are short-TTL - only scre
 const RECENT_MS = 6 * 60 * 60 * 1000; // pushes only for recent items
 const HEARTBEAT_MS = 12 * 60 * 60 * 1000;
 // generic single-use pairing-link pattern; the watched host is never named here
-const LINK_RE = /https:\/\/\d+\.\d+\.\d+\.\d+:\d+\/pair#token=[A-Z0-9]+/g;
+// any host, IP or name, with or without a port
+const LINK_RE = /https:\/\/[A-Za-z0-9._:-]+\/pair#token=[A-Z0-9]+/g;
 
 function log(m) { console.log(new Date().toISOString().slice(0, 19).replace('T', ' ') + ' ' + m); }
 const tokHash = (t) => crypto.createHash('sha256').update(String(t)).digest('hex').slice(0, 32);
